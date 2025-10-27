@@ -5,8 +5,8 @@ from tqdm import tqdm
 import torch, torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
-from dataloader import make_loaders
-from model import DriveSingleShotModel
+from drive_dataloader import make_loaders
+from drive_object_detection_model import DriveSingleShotModel
 from utils import move_batch_to_device, build_anchors_for_model, decode_outputs, compute_map50, save_checkpoint
 from losses import compute_losses
 

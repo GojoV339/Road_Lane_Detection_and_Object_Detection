@@ -82,76 +82,99 @@ def match_anchors_to_gt(anchors_xyxy, gt_boxes_xyxy, gt_labels, pos_iou_thresh=0
 def compute_losses(model_outputs, anchors_norm, targets, input_size, num_classes,
                    focal_alpha=0.25, focal_gamma=2.0, lambda_box=2.0):
     """
-    model_outputs: list of (cls_logits, reg, obj) per level (shapes: (B, A_lvl*num_classes, H, W), etc.)
-    anchors_norm: (A_total, 4) normalized cxcywh (0..1)
-    targets: list length B of {'boxes': (G,4) pixels, 'labels': (G,) ints}
-    Returns: scalar loss (tensor), dict of loss components
+    Robust batch-wise loss computation.
     """
     device = anchors_norm.device
     B = model_outputs[0][0].shape[0]
-    # flatten outputs to (B, A_total, ...)
-    cls_list=[]; reg_list=[]; obj_list=[]
+
+    # flatten outputs
+    cls_list = []; reg_list = []; obj_list = []
     for cls, reg, obj in model_outputs:
-        # cls shape (B, A_lvl*num_classes, H, W) -> convert to (B, A_lvl, num_classes)
+        if cls.dim() != 4 or reg.dim() != 4 or obj.dim() != 4:
+            raise RuntimeError("Expected 4D tensors from model heads")
         b, c, H, W = cls.shape
-        cls = cls.permute(0,2,3,1).contiguous().view(b, -1, cls.shape[1]//( (H*W) if False else cls.shape[1]))  # fallback
-        cls = cls.permute(0,2,1) if False else cls  # no-op safe
-        # simpler reliable reshape:
-        cls = cls.permute(0,2,3,1).contiguous().view(b, -1, cls.shape[-1])
-        # regression: (B, A_lvl*4, H, W) -> (B, A_lvl, 4)
-        reg = reg.permute(0,2,3,1).contiguous().view(b, -1, 4)
-        obj = obj.permute(0,2,3,1).contiguous().view(b, -1, 1)
+        # anchors-per-cell this level
+        if (reg.shape[1] % 4) != 0:
+            raise RuntimeError("reg channels not divisible by 4")
+        A_lvl = reg.shape[1] // 4
+        # infer num_classes robustly
+        if (c % A_lvl) != 0:
+            raise RuntimeError("unable to infer num_classes from cls channels")
+        level_classes = c // A_lvl
+        # reshape
+        cls = cls.permute(0,2,3,1).contiguous().view(b, H * W * A_lvl, level_classes)
+        reg = reg.permute(0,2,3,1).contiguous().view(b, H * W * A_lvl, 4)
+        obj = obj.permute(0,2,3,1).contiguous().view(b, H * W * A_lvl, 1)
         cls_list.append(cls); reg_list.append(reg); obj_list.append(obj)
-    cls_all = torch.cat(cls_list, dim=1)   # (B, A, num_classes)
-    reg_all = torch.cat(reg_list, dim=1)   # (B, A, 4)  (we assume network outputs normalized cxcywh directly)
-    obj_all = torch.cat(obj_list, dim=1)   # (B, A, 1)
+
+    cls_all = torch.cat(cls_list, dim=1)   # (B, A_total, num_classes)
+    reg_all = torch.cat(reg_list, dim=1)   # (B, A_total, 4)
+    obj_all = torch.cat(obj_list, dim=1)   # (B, A_total, 1)
     A = cls_all.shape[1]
 
-    # anchors in pixels
     anchors_xyxy = cxcywh_to_xyxy(anchors_norm.to(device), input_size)  # (A,4)
-
     focal = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction='sum')
 
-    total_cls_loss = 0.0; total_box_loss = 0.0
+    total_cls_loss = torch.tensor(0.0, device=device)
+    total_box_loss = torch.tensor(0.0, device=device)
     total_pos = 0
+
+    # process each image in batch
     for i in range(B):
-        gt = targets[i]
-        gt_boxes = gt['boxes'].to(device)   # (G,4) pixels
-        gt_labels = gt['labels'].to(device) # (G,)
+        sample = targets[i]
+        gt_boxes = sample['boxes'].to(device)   # (G,4) or empty
+        gt_labels = sample['labels'].to(device) # (G,) or empty
+
+        # runtime fix if labels are 1-based (1..N)
+        if gt_labels.numel() > 0 and gt_labels.max().item() >= num_classes:
+            gt_labels = (gt_labels - 1).clamp(min=0, max=num_classes-1)
+
         labels_assign, assigned_gt = match_anchors_to_gt(anchors_xyxy, gt_boxes, gt_labels)
-        # build classification targets (one-hot)
+
         cls_target = torch.zeros((A, num_classes), device=device)
         pos_mask = labels_assign == 1
-        neg_mask = labels_assign == 0
         ignore_mask = labels_assign == -1
+
         if pos_mask.sum() > 0:
-            matched_idxs = assigned_gt[pos_mask]  # indices into GT
-            # set class one-hot for positives
-            cls_target[pos_mask, gt_labels[matched_idxs]] = 1.0
-        # compute classification loss only on non-ignored anchors
-        cls_pred = cls_all[i]  # (A, num_classes) logits
-        cls_weights = (~ignore_mask).float()  # 1 for used anchors
+            matched_idxs = assigned_gt[pos_mask]           # indices into GT
+            pos_indices = pos_mask.nonzero(as_tuple=False).squeeze(1)
+            gt_cls_per_pos = gt_labels[matched_idxs]
+            # safe assignment per positive anchor
+            for anchor_idx, cls_id in zip(pos_indices.tolist(), gt_cls_per_pos.tolist()):
+                cls_target[anchor_idx, int(cls_id)] = 1.0
+
+        # classification loss (ignore positions marked -1)
+        cls_pred = cls_all[i]  # (A, num_classes)
+        cls_weights = (~ignore_mask).float()
         cls_loss = focal(cls_pred, cls_target, weights=cls_weights)
-        total_cls_loss += cls_loss
+        total_cls_loss = total_cls_loss + cls_loss
 
         # box loss for positives
         if pos_mask.sum() > 0:
             total_pos += int(pos_mask.sum())
-            # predicted reg for positive anchors (we assume network predicts normalized cxcywh)
-            pred_regs = reg_all[i][pos_mask]        # (P,4) normalized
+            pred_regs = reg_all[i][pos_mask]                 # (P,4) normalized
             pred_boxes = cxcywh_to_xyxy(pred_regs, input_size)  # (P,4) pixels
-            gt_for_pos = gt_boxes[ assigned_gt[pos_mask] ]      # (P,4) pixels
+            gt_for_pos = gt_boxes[ assigned_gt[pos_mask] ]       # (P,4)
             box_loss = giou_loss(pred_boxes, gt_for_pos)
-            total_box_loss += box_loss
-        else:
-            total_box_loss += 0.0
+            total_box_loss = total_box_loss + box_loss
 
-    # normalize
+    # finalize
     if total_pos == 0:
         loss = total_cls_loss + lambda_box * total_box_loss
-        return loss, {"cls": float(total_cls_loss), "box": float(total_box_loss), "pos": 0}
+        return loss, {
+            "cls": (total_cls_loss.detach().item() if isinstance(total_cls_loss, torch.Tensor) else float(total_cls_loss)),
+            "box": (total_box_loss.detach().item() if isinstance(total_box_loss, torch.Tensor) else float(total_box_loss)),
+            "pos": 0
+        }
+
     loss = (total_cls_loss / B) + lambda_box * (total_box_loss / B)
-    return loss, {"cls": float(total_cls_loss / B), "box": float(total_box_loss / B), "pos": total_pos}
+    return loss, {
+        "cls": (total_cls_loss.detach().item() / B if isinstance(total_cls_loss, torch.Tensor) else float(total_cls_loss) / B),
+        "box": (total_box_loss.detach().item() / B if isinstance(total_box_loss, torch.Tensor) else float(total_box_loss) / B),
+        "pos": total_pos
+    }
+
+
 
 # --- util: convert normalized cxcywh -> xyxy pixels ---
 def cxcywh_to_xyxy(boxes, input_size):

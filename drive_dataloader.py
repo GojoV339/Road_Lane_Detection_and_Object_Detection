@@ -194,12 +194,53 @@ class DriveIndiaDataset(Dataset):
 
 
 
+
+from torch.utils.data import DataLoader
+
 def collate_fn(batch):
     imgs = [b[0] for b in batch]
     targets = [b[1] for b in batch]
     images = torch.stack(imgs, dim=0)
     return images, targets
 
+def make_loaders(root: str,
+                 batch_size: int = 8,
+                 input_size: int = 640,
+                 num_workers: int = 4,
+                 pin_memory: bool = True):
+    """
+    Factory that returns (train_loader, val_loader, test_loader).
+    Keeps pin_memory True only when CUDA is available.
+    """
+    train_ds = DriveIndiaDataset(root, split="train1", input_size=input_size, augment=True)
+    val_ds   = DriveIndiaDataset(root, split="val",    input_size=input_size, augment=False)
+    test_ds  = DriveIndiaDataset(root, split="test",   input_size=input_size, augment=False)
+
+    # pin_memory only useful if cuda available
+    pin = bool(pin_memory and torch.cuda.is_available())
+
+    train_loader = DataLoader(train_ds,
+                              batch_size=batch_size,
+                              shuffle=True,
+                              num_workers=num_workers,
+                              pin_memory=pin,
+                              collate_fn=collate_fn)
+
+    val_loader = DataLoader(val_ds,
+                            batch_size=batch_size,
+                            shuffle=False,
+                            num_workers=num_workers,
+                            pin_memory=pin,
+                            collate_fn=collate_fn)
+
+    test_loader = DataLoader(test_ds,
+                             batch_size=batch_size,
+                             shuffle=False,
+                             num_workers=num_workers,
+                             pin_memory=pin,
+                             collate_fn=collate_fn)
+
+    return train_loader, val_loader, test_loader
 
 
 def move_batch_to_device(batch, device):

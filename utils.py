@@ -37,39 +37,77 @@ def cxcywh_to_xyxy(boxes, input_size):
     return b
 
 def decode_outputs(output_list, anchors_norm, input_size=640, conf_thresh=0.05, iou_thres=0.5):
-    # flatten outputs
+    """
+    Robust decoder.
+    - output_list: list of (cls_logits, reg, obj) per FPN level
+      cls_logits: (B, A_lvl * num_classes, H, W)
+      reg: (B, A_lvl * 4, H, W)    (we assume normalized cxcywh)
+      obj: (B, A_lvl * 1, H, W)
+    - anchors_norm: (A_total,4) normalized cxcywh (not used to decode reg but used for size)
+    """
     B = output_list[0][0].shape[0]
-    cls_list=[]; reg_list=[]; obj_list=[]
+    cls_list = []; reg_list = []; obj_list = []
+
     for cls, reg, obj in output_list:
-        b, c, H, W = cls.shape
-        cls = cls.permute(0,2,3,1).contiguous().view(b, -1, cls.shape[-1])
-        reg = reg.permute(0,2,3,1).contiguous().view(b, -1, 4)
-        obj = obj.permute(0,2,3,1).contiguous().view(b, -1, 1)
+        # cls/reg/obj are 4D: (B, C, H, W)
+        if cls.dim() != 4 or reg.dim() != 4 or obj.dim() != 4:
+            raise RuntimeError("Expected 4D tensors in decoder")
+
+        b, c_cls, H, W = cls.shape
+        _, c_reg, _, _ = reg.shape
+        _, c_obj, _, _ = obj.shape
+
+        # convert to (B, H, W, C)
+        cls = cls.permute(0, 2, 3, 1).contiguous()   # (B, H, W, c_cls)
+        reg = reg.permute(0, 2, 3, 1).contiguous()   # (B, H, W, c_reg)
+        obj = obj.permute(0, 2, 3, 1).contiguous()   # (B, H, W, c_obj)
+
+        # anchors per cell for this level
+        if (c_reg % 4) != 0:
+            raise RuntimeError(f"Unexpected reg channels {c_reg}; must be divisible by 4")
+        A_lvl = c_reg // 4
+
+        # num_classes per anchor
+        if (c_cls % A_lvl) != 0:
+            raise RuntimeError(f"Cannot infer num_classes: c_cls={c_cls}, A_lvl={A_lvl}")
+        num_classes = c_cls // A_lvl
+
+        # reshape to (B, A_lvl * H * W, num_classes) etc.
+        cls = cls.view(b, H * W * A_lvl, num_classes)
+        reg = reg.view(b, H * W * A_lvl, 4)
+        obj = obj.view(b, H * W * A_lvl, 1)
+
         cls_list.append(cls); reg_list.append(reg); obj_list.append(obj)
-    cls_all = torch.cat(cls_list, dim=1); reg_all = torch.cat(reg_list, dim=1); obj_all = torch.cat(obj_list, dim=1)
+
+    # concat across pyramid levels
+    cls_all = torch.cat(cls_list, dim=1)   # (B, A_total, num_classes)
+    reg_all = torch.cat(reg_list, dim=1)   # (B, A_total, 4)
+    obj_all = torch.cat(obj_list, dim=1)   # (B, A_total, 1)
+
     anchors_xyxy = cxcywh_to_xyxy(anchors_norm, input_size)
-    results=[]
+    results = []
     for b in range(B):
-        scores = (cls_all[b].sigmoid() * obj_all[b].sigmoid())  # (A, C)
+        scores = (cls_all[b].sigmoid() * obj_all[b].sigmoid())  # (A, num_classes)
         max_scores, labels = scores.max(dim=1)
-        keep_mask = max_scores > conf_thresh
-        if keep_mask.sum()==0:
+        keep = max_scores > conf_thresh
+        if keep.sum() == 0:
             results.append([])
             continue
-        idx = keep_mask.nonzero(as_tuple=False).squeeze(1)
+        idx = keep.nonzero(as_tuple=False).squeeze(1)
         chosen_scores = max_scores[idx]; chosen_labels = labels[idx]
-        chosen_regs = reg_all[b][idx]  # assume reg is normalized cxcywh
-        boxes = cxcywh_to_xyxy(chosen_regs, input_size)
-        detections=[]
-        for cls_id in chosen_labels.unique():
-            cls_mask = chosen_labels == cls_id
-            bboxes = boxes[cls_mask]; sc = chosen_scores[cls_mask]
-            if bboxes.numel()==0: continue
-            keep = nms(bboxes, sc, iou_thres)
-            for k in keep:
-                detections.append((bboxes[k].cpu(), sc[k].item(), int(cls_id.item())))
+        chosen_regs = reg_all[b][idx]  # normalized cxcywh
+        chosen_boxes = cxcywh_to_xyxy(chosen_regs, input_size)
+        detections = []
+        for cls_id in torch.unique(chosen_labels):
+            mask = chosen_labels == cls_id
+            if mask.sum() == 0: continue
+            boxes_cls = chosen_boxes[mask]; scores_cls = chosen_scores[mask]
+            keep_idx = nms(boxes_cls, scores_cls, iou_thres)
+            for k in keep_idx:
+                detections.append((boxes_cls[k].cpu(), scores_cls[k].item(), int(cls_id.item())))
         results.append(detections)
     return results
+
 
 # simple mAP50 evaluator (same as earlier but concise)
 def compute_map50(predictions, targets, num_classes=24, iou_threshold=0.5):
